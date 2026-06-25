@@ -82,6 +82,11 @@ import numpy as np
 
 from libcpp.vector cimport vector
 from libc cimport math
+from cython.parallel cimport prange
+
+cdef extern from "nsgrid_omp.h" nogil:
+    int omp_get_max_threads()
+    int omp_get_thread_num()
 
 cdef int END = -1
 
@@ -418,7 +423,7 @@ cdef class FastNS(object):
                 self.next_id[i] = self.head_id[j]
                 self.head_id[j] = i
 
-    cdef int coord2cellid(self, const float* coord) nogil:
+    cdef int coord2cellid(self, const float* coord) noexcept nogil:
         """Finds the cell-id for the given coordinate
 
         Note
@@ -432,7 +437,7 @@ cdef class FastNS(object):
 
         return xyz[0] + xyz[1] * self.cell_offsets[1] + xyz[2] * self.cell_offsets[2]
 
-    cdef void coord2cellxyz(self, const float* coord, int* xyz) nogil:
+    cdef void coord2cellxyz(self, const float* coord, int* xyz) noexcept nogil:
         """Calculate cell coordinate for coord"""
         # This assumes coordinate is inside the primary unit cell
         xyz[2] = <int> (coord[2] / self.cellsize[ZZ])
@@ -445,7 +450,7 @@ cdef class FastNS(object):
         xyz[1] %= self.ncells[1]
         xyz[2] %= self.ncells[2]
 
-    cdef int cellxyz2cellid(self, int cx, int cy, int cz) nogil:
+    cdef int cellxyz2cellid(self, int cx, int cy, int cz) noexcept nogil:
         """Convert cell coordinate to cell id, END for out of bounds"""
         if cx < 0:
             if self.periodic[0]:
@@ -480,7 +485,7 @@ cdef class FastNS(object):
 
         return cx + cy * self.cell_offsets[1] + cz * self.cell_offsets[2]
 
-    cdef double calc_distsq(self, const float* a, const float* b) nogil:
+    cdef double calc_distsq(self, const float* a, const float* b) noexcept nogil:
         cdef double dx[3]
 
         dx[0] = a[0] - b[0]
@@ -495,6 +500,62 @@ cdef class FastNS(object):
                                           &self.half_dimensions[0])
 
         return dx[0]*dx[0] + dx[1]*dx[1] + dx[2]*dx[2]
+
+    cdef Py_ssize_t _gather_one(self, int i, float[:, :] search_coords,
+                          double cutoff2, int *pairs, double *dist2,
+                          Py_ssize_t base) noexcept nogil:
+        """Find the neighbours of query atom ``i`` and return how many there
+        are. If ``pairs``/``dist2`` are non-NULL, the neighbours are also
+        written into them starting at offset ``base`` (``pairs`` holds two
+        ints per neighbour, ``dist2`` one double).
+
+        Used for both passes of :meth:`search`: a counting pass (NULL outputs)
+        followed by a fill pass into preallocated, disjoint output ranges.
+        Factored into a method so the per-atom scratch arrays are function
+        locals, hence thread-private under ``prange``.
+        """
+        cdef int cx, cy, cz, xi, yi, zi, cellid, j
+        cdef int cellcoord[3]
+        cdef float tmpcoord[3]
+        cdef double d2
+        cdef Py_ssize_t cnt = 0
+
+        tmpcoord[0] = search_coords[i][0]
+        tmpcoord[1] = search_coords[i][1]
+        tmpcoord[2] = search_coords[i][2]
+        if self.triclinic:
+            _triclinic_pbc(<coordinate*>&tmpcoord[0], 1,
+                           &self.triclinic_dimensions[0])
+        else:
+            _ortho_pbc(<coordinate*>&tmpcoord[0], 1,
+                       &self.dimensions[0])
+        # which cell is atom *i* in
+        self.coord2cellxyz(&tmpcoord[0], cellcoord)
+        # loop over all 27 neighbouring cells
+        for xi in range(3):
+            for yi in range(3):
+                for zi in range(3):
+                    cx = cellcoord[0] - 1 + xi
+                    cy = cellcoord[1] - 1 + yi
+                    cz = cellcoord[2] - 1 + zi
+                    cellid = self.cellxyz2cellid(cx, cy, cz)
+
+                    if cellid == END:  # out of bounds
+                        continue
+                    # for loop over atoms in searchcoord
+                    j = self.head_id[cellid]
+                    while (j != END):
+                        d2 = self.calc_distsq(&tmpcoord[0],
+                                              &self.coords_bbox[j][0])
+                        if d2 <= cutoff2:
+                            if pairs != NULL:
+                                # place search_coords then self.bbox_coords
+                                pairs[2 * (base + cnt)] = i
+                                pairs[2 * (base + cnt) + 1] = j
+                                dist2[base + cnt] = d2
+                            cnt += 1
+                        j = self.next_id[j]
+        return cnt
 
     def search(self, float[:, :] search_coords):
         """Search a group of atoms against initialized coordinates
@@ -527,56 +588,48 @@ cdef class FastNS(object):
         if any of the query coordinates lies outside the `box` supplied to
         :class:`~MDAnalysis.lib.nsgrid.FastNS`.
         """
-        cdef int i, j, size_search
-        cdef int cx, cy, cz
-        cdef int cellid
-        cdef int xi, yi, zi
-        cdef int cellcoord[3]
-        cdef float tmpcoord[3]
-
+        cdef int i, size_search
         cdef NSResults results = NSResults()
-        cdef double d2, cutoff2
-
-        cutoff2 = self.cutoff * self.cutoff
+        cdef double cutoff2 = self.cutoff * self.cutoff
+        cdef int nthreads = omp_get_max_threads()
+        # offsets[i + 1] first holds the neighbour count of atom i, then is
+        # prefix-summed so offsets[i] is where atom i's output starts. This
+        # lets every atom write into a disjoint, preallocated range in the fill
+        # pass -- no per-thread growth, no false sharing, no locking.
+        cdef vector[Py_ssize_t] offsets
+        cdef Py_ssize_t total
+        cdef int *pairs_ptr
+        cdef double *dist2_ptr
 
         if (search_coords.ndim != 2 or search_coords.shape[1] != 3):
             raise ValueError("search_coords must have a shape of (n, 3), got "
                              "{}.".format(search_coords.shape))
 
-        with nogil:
-            size_search = search_coords.shape[0]
-            for i in range(size_search):
-                tmpcoord[0] = search_coords[i][0]
-                tmpcoord[1] = search_coords[i][1]
-                tmpcoord[2] = search_coords[i][2]
-                if self.triclinic:
-                    _triclinic_pbc(<coordinate*>&tmpcoord[0], 1,
-                                   &self.triclinic_dimensions[0])
-                else:
-                    _ortho_pbc(<coordinate*>&tmpcoord[0], 1,
-                               &self.dimensions[0])
-                # which cell is atom *i* in
-                self.coord2cellxyz(&tmpcoord[0], cellcoord)
-                # loop over all 27 neighbouring cells
-                for xi in range(3):
-                    for yi in range(3):
-                        for zi in range(3):
-                            cx = cellcoord[0] - 1 + xi
-                            cy = cellcoord[1] - 1 + yi
-                            cz = cellcoord[2] - 1 + zi
-                            cellid = self.cellxyz2cellid(cx, cy, cz)
+        size_search = search_coords.shape[0]
+        offsets.resize(size_search + 1)
 
-                            if cellid == END:  # out of bounds
-                                continue
-                            # for loop over atoms in searchcoord
-                            j = self.head_id[cellid]
-                            while (j != END):
-                                d2 = self.calc_distsq(&tmpcoord[0],
-                                                      &self.coords_bbox[j][0])
-                                if d2 <= cutoff2:
-                                    # place search_coords then self.bbox_coords
-                                    results.add_neighbors(i, j, d2)
-                                j = self.next_id[j]
+        with nogil:
+            # pass 1: count neighbours per query atom (disjoint writes)
+            for i in prange(size_search, schedule='static',
+                            num_threads=nthreads):
+                offsets[i + 1] = self._gather_one(i, search_coords, cutoff2,
+                                                  NULL, NULL, 0)
+            # exclusive prefix sum (serial, cheap)
+            for i in range(size_search):
+                offsets[i + 1] += offsets[i]
+
+        total = offsets[size_search]
+        if total > 0:
+            results.pairs.resize(2 * total)
+            results.distances2.resize(total)
+            pairs_ptr = results.pairs.data()
+            dist2_ptr = results.distances2.data()
+            # pass 2: fill the preallocated arrays at disjoint offsets
+            with nogil:
+                for i in prange(size_search, schedule='static',
+                                num_threads=nthreads):
+                    self._gather_one(i, search_coords, cutoff2,
+                                     pairs_ptr, dist2_ptr, offsets[i])
         return results
 
     def self_search(self):

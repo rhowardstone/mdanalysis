@@ -484,9 +484,10 @@ def extensions(config):
         ["MDAnalysis/lib/nsgrid" + cpp_source_suffix],
         include_dirs=include_dirs + ["MDAnalysis/lib/include"],
         language="c++",
-        define_macros=define_macros,
-        extra_compile_args=cpp_extra_compile_args,
-        extra_link_args=cpp_extra_link_args,
+        libraries=parallel_libraries,
+        define_macros=define_macros + parallel_macros,
+        extra_compile_args=parallel_args + cpp_extra_compile_args,
+        extra_link_args=parallel_args + cpp_extra_link_args,
     )
     pre_exts = [
         libdcd,
